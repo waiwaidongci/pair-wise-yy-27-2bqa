@@ -23,6 +23,10 @@ class CollationFlowTest(unittest.TestCase):
         exported=self.db.export_collation(self.work,self.reviewer)
         self.assertEqual(1,exported["gap_count"])
         self.assertTrue(exported["passages"][0]["variants"][0]["notes"] == [])
+        with self.assertRaisesRegex(DomainError,"定稿"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        gap_id=exported["passages"][0]["gaps"][0]["id"]
+        self.db.set_gap_disposition(gap_id,self.owner,"explained","乙本此处缺叶，据甲本存真")
         self.db.lock_passage(self.passage,self.owner,"定稿")
         with self.assertRaisesRegex(DomainError,"锁定"):
             self.db.update_variant(variant,"另一文本","无意义修改",self.editor,2)

@@ -25,6 +25,8 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/state": return self._json(200,self.db.snapshot())
             if len(parts)==5 and parts[:2]==["api","passages"] and parts[3]=="snapshots":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="gaps":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_gap_list(int(parts[2]),uid))
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
             self._json(404,{"ok":False,"error":"接口不存在"})
@@ -43,6 +45,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/variants": return self._json(201,{"ok":True,"id":self.db.create_variant(int(b.get("passage_id",0)),int(b.get("witness_id",0)),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
+            if len(parts)==4 and parts[:2]==["api","gaps"] and parts[3]=="disposition": self.db.set_gap_disposition(int(parts[2]),int(b.get("user_id",0)),str(b.get("status","")),str(b.get("note",""))); return self._json(200,{"ok":True})
             if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
