@@ -16,19 +16,23 @@ python -m unittest discover -s tests -v
 - 版本类型限定为 `version`、`fragment`、`transcription`。
 - 段落和版本必须属于同一作品，同一版本不能重复对齐同一段落。
 - 只有负责人或被单独授权的编辑可以修改对应版本；其他用户只有查看权限。
-- `[缺页]`、`[不可辨]`、`[残损]` 等标记会参与校勘稿导出和缺口统计，不匹配的方括号会拒绝保存。
+- `[缺页]`、`[不可辨]`、`[残损]` 三类标记会在保存或重对齐时按「版本+段落+标记」自动对账为逐条缺口：记录出现次数和当前文本，重复保存不累加；标记消失则删除，标记仍在则保留处理说明。
+- 每条缺口由负责人写处理说明并标注状态：`confirmed`（据实缺失）、`pending`（待补）、`explained`（已说明），说明不能为空。
+- 段落存在未写处理说明的缺口时禁止锁定定稿。
 - 每次新增或修改异文都会产生递增修订号和 JSON 快照；提交必须携带 `expected_revision`，旧页面不能覆盖新层。
-- 锁定段落由负责人执行，锁定后任何新修订都会被拒绝。
+- 锁定段落由负责人执行，锁定后任何新修订和重对齐都会被拒绝。
 
 ## 主要接口
 
 - `POST /api/users`、`POST /api/works`
 - `POST /api/works/{id}/witnesses`、`POST /api/witnesses/{id}/editors`
 - `POST /api/works/{id}/passages`、`POST /api/works/{id}/access`
-- `POST /api/alignments`
+- `POST /api/alignments`（同一版本+段落重复保存为重对齐，幂等更新并对账缺口）
 - `POST /api/variants`、`POST /api/variants/{id}/revisions`
 - `GET /api/passages/{id}/snapshots/{revision}?user_id=...`
 - `POST /api/passages/{id}/lock`
+- `GET /api/works/{id}/gaps?user_id=...`：按版本展开缺口明细、待办数量及段落定稿状态
+- `POST /api/gaps/{id}/handling`：负责人写处理说明（`disposition`、`note`）
 - `GET /api/works/{id}/collation?user_id=...`
 
-导出接口把版本对齐、异文、注释、残损缺口和锁定状态组合成可复核的校勘稿。
+导出接口把版本对齐、异文、注释、缺口清单（逐条标记、出现次数、当前修订、处理状态与说明、按版本汇总的待办数）和锁定状态组合成可复核的校勘稿。

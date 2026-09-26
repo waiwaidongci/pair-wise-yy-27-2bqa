@@ -22,7 +22,12 @@ class CollationFlowTest(unittest.TestCase):
         self.assertEqual(2,snap["layer"])
         exported=self.db.export_collation(self.work,self.reviewer)
         self.assertEqual(1,exported["gap_count"])
+        self.assertEqual(1,exported["gap_summary"]["todo_items"])
         self.assertTrue(exported["passages"][0]["variants"][0]["notes"] == [])
+        with self.assertRaisesRegex(DomainError,"未写处理说明"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        gaps=self.db.list_gaps(self.work,self.owner)["witnesses"][1]["gaps"]
+        self.db.set_gap_handling(gaps[0]["id"],"confirmed","胶片比对确为缺页",self.owner)
         self.db.lock_passage(self.passage,self.owner,"定稿")
         with self.assertRaisesRegex(DomainError,"锁定"):
             self.db.update_variant(variant,"另一文本","无意义修改",self.editor,2)
@@ -36,5 +41,40 @@ class CollationFlowTest(unittest.TestCase):
             self.db.export_collation(self.work,self.outsider)
         with self.assertRaisesRegex(DomainError,"括号"):
             self.db.align_passage(self.passage,self.w1,"文本[未闭合",9,self.owner)
+    def test_realign_gap_idempotent_and_statuses(self):
+        # 重复保存同一对齐不累加缺口
+        self.db.align_passage(self.passage,self.w2,"春水[缺页]，[残损][残损]。",2,self.editor)
+        listing=self.db.list_gaps(self.work,self.owner)
+        bucket=next(w for w in listing["witnesses"] if w["id"]==self.w2)
+        self.assertEqual(2,bucket["todo_count"])
+        by_mark={g["mark"]:g for g in bucket["gaps"]}
+        self.assertEqual(1,by_mark["缺页"]["occurrences"])
+        self.assertEqual(2,by_mark["残损"]["occurrences"])
+        # 再次保存次数不翻倍
+        self.db.align_passage(self.passage,self.w2,"春水[缺页]，[残损][残损]。",2,self.editor)
+        bucket=next(w for w in self.db.list_gaps(self.work,self.owner)["witnesses"] if w["id"]==self.w2)
+        self.assertEqual({("缺页",1),("残损",2)},{(g["mark"],g["occurrences"]) for g in bucket["gaps"]})
+        # 负责人写处理说明：据实缺失 / 待补 / 已说明
+        self.db.set_gap_handling(by_mark["缺页"]["id"],"confirmed","对照底本确为脱页",self.owner)
+        self.db.set_gap_handling(by_mark["残损"]["id"],"explained","残损字据他本校勘说明",self.owner)
+        exported=self.db.export_collation(self.work,self.owner)
+        self.assertEqual(0,exported["gap_summary"]["todo_items"])
+        self.assertEqual({"confirmed":1,"pending":0,"explained":1},exported["gap_summary"]["by_disposition"])
+        # 非负责人不能写处理说明
+        with self.assertRaisesRegex(DomainError,"负责人"):
+            self.db.set_gap_handling(by_mark["缺页"]["id"],"pending","编辑越权",self.editor)
+        with self.assertRaisesRegex(DomainError,"处理说明不能为空"):
+            self.db.set_gap_handling(by_mark["缺页"]["id"],"confirmed","  ",self.owner)
+        # 重新对齐后标记消失，缺口删除；仍在的标记保留处理说明
+        self.db.align_passage(self.passage,self.w2,"春水东流，[缺页]",2,self.editor)
+        bucket=next(w for w in self.db.list_gaps(self.work,self.owner)["witnesses"] if w["id"]==self.w2)
+        remaining={g["mark"]:g for g in bucket["gaps"]}
+        self.assertEqual({"缺页"},set(remaining))
+        self.assertEqual("confirmed",remaining["缺页"]["disposition"])
+        self.assertEqual("对照底本确为脱页",remaining["缺页"]["handling_note"])
+        # 待补缺口未处理时不能定稿
+        self.db.align_passage(self.passage,self.w2,"[不可辨]",2,self.editor)
+        with self.assertRaisesRegex(DomainError,"未写处理说明"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
 
 if __name__=="__main__": unittest.main()

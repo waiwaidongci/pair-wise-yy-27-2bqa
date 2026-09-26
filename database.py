@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -13,6 +14,10 @@ class DomainError(ValueError):
 
 WITNESS_KINDS = {"version", "fragment", "transcription"}
 SPECIAL_TOKENS = {"[缺页]", "[不可辨]", "[残损]", "[插入]", "[删除]"}
+GAP_MARKS = ("缺页", "不可辨", "残损")
+GAP_STATUSES = {"confirmed", "pending", "explained"}
+GAP_STATUS_LABEL = {"confirmed": "据实缺失", "pending": "待补", "explained": "已说明"}
+_MARK_RE = re.compile(r"\[(缺页|不可辨|残损)\]")
 
 
 def validate_transcription(text: str) -> str:
@@ -144,6 +149,24 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS gaps (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              witness_id INTEGER NOT NULL REFERENCES witnesses(id) ON DELETE CASCADE,
+              mark TEXT NOT NULL CHECK(mark IN ('缺页','不可辨','残损')),
+              ordinal INTEGER NOT NULL,
+              occurrences INTEGER NOT NULL DEFAULT 1,
+              current_text TEXT NOT NULL DEFAULT '',
+              disposition TEXT NOT NULL DEFAULT 'pending' CHECK(disposition IN ('confirmed','pending','explained')),
+              handling_note TEXT NOT NULL DEFAULT '',
+              note_by INTEGER REFERENCES users(id),
+              noted_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(passage_id,witness_id,mark,ordinal)
+            );
+            CREATE INDEX IF NOT EXISTS idx_gaps_work ON gaps(work_id,witness_id);
             """
         )
         self.conn.commit()
@@ -162,6 +185,8 @@ class CollationDB:
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
         variant = self.create_variant(passage, w2, "春水东流，故人南去。", "综合语义与行款补足", owner, 0)
         self.add_note(variant, "补字仍需参照纸背墨迹。", editor)
+        gap = self.conn.execute("SELECT id FROM gaps WHERE passage_id=? AND witness_id=?", (passage, w2)).fetchone()
+        self.set_gap_handling(int(gap["id"]), "pending", "两处不可辨待核胶片后补字。", owner)
 
     def add_user(self, name: str, role: str) -> int:
         if not name.strip() or role not in {"owner", "editor", "reviewer"}:
@@ -274,16 +299,146 @@ class CollationDB:
             raise DomainError("无权编辑该版本")
         if sort_order <= 0:
             raise DomainError("排序号必须大于0")
+        if passage["status"] == "locked" or self.conn.execute("SELECT 1 FROM passage_locks WHERE passage_id=?", (passage_id,)).fetchone():
+            raise DomainError("段落已锁定，不能修改")
         text = validate_transcription(aligned_text)
         with self.transaction():
-            try:
+            row = self.conn.execute(
+                "SELECT id FROM alignments WHERE passage_id=? AND witness_id=?", (passage_id, witness_id)
+            ).fetchone()
+            if row:
+                alignment_id = int(row["id"])
+                self.conn.execute(
+                    "UPDATE alignments SET aligned_text=?,sort_order=? WHERE id=?",
+                    (text, sort_order, alignment_id),
+                )
+            else:
                 cur = self.conn.execute(
                     "INSERT INTO alignments(passage_id,witness_id,aligned_text,sort_order,created_by,created_at) VALUES(?,?,?,?,?,?)",
                     (passage_id, witness_id, text, sort_order, user_id, datetime.now().isoformat()),
                 )
-            except sqlite3.IntegrityError as exc:
-                raise DomainError("该版本已经对齐此段落") from exc
-        return int(cur.lastrowid)
+                alignment_id = int(cur.lastrowid)
+            self._reconcile_gaps(passage["work_id"], passage_id, witness_id, text)
+        return alignment_id
+
+    @staticmethod
+    def _mark_counts(text: str) -> dict:
+        counts = {mark: 0 for mark in GAP_MARKS}
+        for mark in _MARK_RE.findall(text):
+            counts[mark] += 1
+        return counts
+
+    def _reconcile_gaps(self, work_id: int, passage_id: int, witness_id: int, aligned_text: str) -> None:
+        """按 版本+段落+标记类型 对账缺口：同一处只更新出现次数，重复保存不累加。
+
+        标记仍在则保留既有处理说明；标记消失则删除该条缺口。
+        """
+        now = datetime.now().isoformat()
+        counts = self._mark_counts(aligned_text)
+        for mark, count in counts.items():
+            row = self.conn.execute(
+                "SELECT id FROM gaps WHERE passage_id=? AND witness_id=? AND mark=?",
+                (passage_id, witness_id, mark),
+            ).fetchone()
+            if count == 0:
+                if row:
+                    self.conn.execute("DELETE FROM gaps WHERE id=?", (row["id"],))
+                continue
+            if row:
+                self.conn.execute(
+                    "UPDATE gaps SET occurrences=?,current_text=?,updated_at=? WHERE id=?",
+                    (count, aligned_text, now, row["id"]),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO gaps(work_id,passage_id,witness_id,mark,ordinal,occurrences,current_text,"
+                    "disposition,handling_note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (work_id, passage_id, witness_id, mark, 1, count, aligned_text, "pending", "", now, now),
+                )
+
+    def set_gap_handling(self, gap_id: int, disposition: str, note: str, user_id: int) -> None:
+        gap = self.conn.execute("SELECT * FROM gaps WHERE id=?", (gap_id,)).fetchone()
+        if not gap:
+            raise DomainError("缺口记录不存在")
+        self._require_owner(gap["work_id"], user_id)
+        if disposition not in GAP_STATUSES:
+            raise DomainError("处理状态必须为 confirmed、pending 或 explained")
+        note = note.strip()
+        if not note:
+            raise DomainError("处理说明不能为空")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE gaps SET disposition=?,handling_note=?,note_by=?,noted_at=?,updated_at=? WHERE id=?",
+                (disposition, note, user_id, datetime.now().isoformat(), datetime.now().isoformat(), gap_id),
+            )
+
+    def _latest_variants(self, work_id: int) -> dict:
+        latest = {}
+        for row in self.conn.execute(
+            "SELECT v.* FROM variants v JOIN passages p ON p.id=v.passage_id "
+            "WHERE p.work_id=? ORDER BY v.layer DESC,v.id DESC", (work_id,)
+        ).fetchall():
+            latest.setdefault((row["passage_id"], row["witness_id"]), dict(row))
+        return latest
+
+    def _gap_rows(self, work_id: int) -> list:
+        rows = self.conn.execute(
+            "SELECT g.*,p.label AS passage_label,w.siglum,w.kind,u.name AS note_by_name FROM gaps g "
+            "JOIN passages p ON p.id=g.passage_id JOIN witnesses w ON w.id=g.witness_id "
+            "LEFT JOIN users u ON u.id=g.note_by "
+            "WHERE g.work_id=? ORDER BY w.id,p.id,g.mark", (work_id,)
+        ).fetchall()
+        latest = self._latest_variants(work_id)
+        gaps = []
+        for row in rows:
+            item = dict(row)
+            item["mark_label"] = f"[{row['mark']}]"
+            item["disposition_label"] = GAP_STATUS_LABEL[row["disposition"]]
+            item["handled"] = bool(row["handling_note"].strip())
+            variant = latest.get((row["passage_id"], row["witness_id"]))
+            item["current_revision"] = {
+                "layer": variant["layer"],
+                "proposed_text": variant["proposed_text"],
+            } if variant else None
+            gaps.append(item)
+        return gaps
+
+    def list_gaps(self, work_id: int, user_id: int) -> dict:
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该校勘项目")
+        gaps = self._gap_rows(work_id)
+        witnesses = {}
+        for row in self.conn.execute(
+            "SELECT w.* FROM witnesses w WHERE w.work_id=? ORDER BY w.id", (work_id,)
+        ).fetchall():
+            witnesses[row["id"]] = {**dict(row), "gaps": [], "todo_count": 0, "occurrence_count": 0}
+        passage_todo = {}
+        for gap in gaps:
+            bucket = witnesses.get(gap["witness_id"])
+            if bucket is not None:
+                bucket["gaps"].append(gap)
+                bucket["occurrence_count"] += gap["occurrences"]
+                if not gap["handled"]:
+                    bucket["todo_count"] += 1
+            passage_todo[gap["passage_id"]] = passage_todo.get(gap["passage_id"], 0) + (0 if gap["handled"] else 1)
+        passages = []
+        for row in self.conn.execute("SELECT id,label,status FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
+            todo = passage_todo.get(row["id"], 0)
+            passages.append({**dict(row), "gap_todo": todo, "finalizable": todo == 0})
+        status_counts = {key: 0 for key in GAP_STATUSES}
+        for gap in gaps:
+            status_counts[gap["disposition"]] += 1
+        return {
+            "work_id": work_id,
+            "witnesses": list(witnesses.values()),
+            "passages": passages,
+            "totals": {
+                "gap_items": len(gaps),
+                "occurrences": sum(g["occurrences"] for g in gaps),
+                "todo_items": sum(1 for g in gaps if not g["handled"]),
+                "by_disposition": status_counts,
+            },
+        }
 
     def create_variant(self, passage_id: int, witness_id: int, proposed_text: str, reason: str,
                        user_id: int, expected_revision: int) -> int:
@@ -372,6 +527,12 @@ class CollationDB:
         if not passage:
             raise DomainError("段落不存在")
         self._require_owner(passage["work_id"], user_id)
+        pending = self.conn.execute(
+            "SELECT COUNT(*) FROM gaps WHERE passage_id=? AND (handling_note IS NULL OR handling_note='')",
+            (passage_id,),
+        ).fetchone()[0]
+        if pending:
+            raise DomainError(f"该段落还有 {pending} 条缺口未写处理说明，不能定稿")
         with self.transaction():
             self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
             self.conn.execute(
@@ -393,8 +554,11 @@ class CollationDB:
             raise DomainError("无权查看该校勘项目")
         work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
         witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
+        gaps = self._gap_rows(work_id)
+        gaps_by_alignment = {}
+        for gap in gaps:
+            gaps_by_alignment.setdefault((gap["passage_id"], gap["witness_id"]), []).append(gap)
         passages = []
-        gaps = 0
         for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
             alignments = []
             for row in self.conn.execute(
@@ -402,17 +566,51 @@ class CollationDB:
                 "WHERE a.passage_id=? ORDER BY a.sort_order", (passage["id"],)
             ).fetchall():
                 item = dict(row)
-                if "[缺页]" in item["aligned_text"] or "[残损]" in item["aligned_text"]:
-                    item["has_gap"] = True
-                    gaps += 1
+                item["marks"] = [f"[{m}]" for m, c in self._mark_counts(item["aligned_text"]).items() for _ in range(c)]
+                item["gap_list"] = gaps_by_alignment.get((passage["id"], item["witness_id"]), [])
                 alignments.append(item)
             variants = []
             for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
                 variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
-        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
+            passage_gaps = [g for g in gaps if g["passage_id"] == passage["id"]]
+            passages.append({
+                **dict(passage),
+                "alignments": alignments,
+                "variants": variants,
+                "gap_items": passage_gaps,
+                "gap_todo": sum(1 for g in passage_gaps if not g["handled"]),
+                "finalizable": all(g["handled"] for g in passage_gaps),
+            })
+        status_counts = {key: 0 for key in GAP_STATUSES}
+        for gap in gaps:
+            status_counts[gap["disposition"]] += 1
+        gap_summary = {
+            "total_items": len(gaps),
+            "total_occurrences": sum(g["occurrences"] for g in gaps),
+            "todo_items": sum(1 for g in gaps if not g["handled"]),
+            "by_disposition": status_counts,
+            "by_witness": [
+                {
+                    "witness_id": w["id"],
+                    "siglum": w["siglum"],
+                    "kind": w["kind"],
+                    "gap_items": len(w["gaps"]),
+                    "occurrences": w["occurrence_count"],
+                    "todo_count": w["todo_count"],
+                }
+                for w in self.list_gaps(work_id, user_id)["witnesses"]
+            ],
+        }
+        return {
+            "work": dict(work),
+            "witnesses": witnesses,
+            "passages": passages,
+            "gap_count": sum(g["occurrences"] for g in gaps),
+            "gap_summary": gap_summary,
+            "gaps": gaps,
+        }
 
     def snapshot(self) -> dict:
         return {
